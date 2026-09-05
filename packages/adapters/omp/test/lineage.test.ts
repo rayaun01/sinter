@@ -452,8 +452,13 @@ describe("carry-forward", () => {
     // The oversized blob is NOT inside the harness's own JSONL line.
     expect(Buffer.byteLength(await Bun.file(ref.nativePath!).text())).toBeLessThan(2 * 1024 * 1024);
 
-    const carried = await readWithCarry(ref.nativePath!, { dialect: OMP_DIALECT });
+    const carried = await readWithCarry(ref.nativePath!, { dialect: OMP_DIALECT, carryRoot: store.carryRoot });
     expect(carried.entries).toEqual(source.entries);
+
+    // Without the root the sidecar was written under, the ref is outside
+    // sinter's carry directory and the read stays native.
+    const unrooted = await readWithCarry(ref.nativePath!, { dialect: OMP_DIALECT });
+    expect(unrooted.entries).not.toEqual(source.entries);
     await store.cleanup();
   });
 

@@ -16,6 +16,8 @@
  * `session.preserve[PRESERVE_KEY]`.
  */
 
+import { realpath } from "node:fs/promises";
+import { isAbsolute, resolve, sep } from "node:path";
 import { DEFAULT_INSTANCE_ID, type HarnessId, type InstanceId, type SifSession } from "./sif";
 import { mintSifId } from "./util";
 
@@ -58,7 +60,11 @@ export interface SinterProvenance {
   inertTools?: boolean;
   /** gzip+base64 of the source SIF, inlined when small — see `encodeCarry`. */
   carry?: string;
-  /** Path to a sidecar carry file when the payload is too big to inline. */
+  /**
+   * Sidecar carry file, used when the payload is too big to inline. The record
+   * travels with the session, so this is attacker-controlled input: readers
+   * must resolve it inside sinter's own carry root — see `loadCarry`.
+   */
   carryRef?: string;
   /** Bytes of the pre-compression carry payload, for reporting. */
   carryBytes?: number;
@@ -241,6 +247,18 @@ export function encodeCarry(session: SifSession, maxBytes = CARRY_MAX_BYTES): st
   return Buffer.from(gz).toString("base64");
 }
 
+/** The only directory sinter reads or writes carry sidecars in: `~/.sinter/carry`. */
+export function carryRoot(root?: string): string {
+  const home = root ?? process.env.SINTER_HOME ?? `${process.env.HOME}/.sinter`;
+  return resolve(home, "carry");
+}
+
+/** One path component, with separators and dot-only names neutralised. */
+function safeSegment(s: string): string {
+  const flat = s.replace(/[/\\]/g, "_");
+  return /^\.+$/.test(flat) ? flat.replace(/\./g, "_") : flat;
+}
+
 /** `~/.sinter/carry/<harness>/<nativeId>.sif.json.gz` — sinter's own directory. */
 export function carrySidecarPath(
   harness: HarnessId,
@@ -248,9 +266,23 @@ export function carrySidecarPath(
   root?: string,
   instanceId: InstanceId = DEFAULT_INSTANCE_ID,
 ): string {
-  const home = root ?? `${process.env.SINTER_HOME ?? `${process.env.HOME}/.sinter`}`;
-  const instancePrefix = instanceId === DEFAULT_INSTANCE_ID ? "" : `${instanceId.replace(/[/\\]/g, "_")}__`;
-  return `${home}/carry/${harness}/${instancePrefix}${nativeId.replace(/[/\\]/g, "_")}.sif.json.gz`;
+  const instancePrefix = instanceId === DEFAULT_INSTANCE_ID ? "" : `${safeSegment(instanceId)}__`;
+  return `${carryRoot(root)}/${safeSegment(harness)}/${instancePrefix}${safeSegment(nativeId)}.sif.json.gz`;
+}
+
+/**
+ * Resolve a record's `carryRef` to a real file inside the carry root, or reject
+ * it. The reference comes from a session another party may have authored, so a
+ * path that leaves the root — absolute, `..`, or a symlink out of it — is not a
+ * carry sidecar and is never read.
+ */
+async function resolveCarryRef(ref: string, root?: string): Promise<string | undefined> {
+  const base = carryRoot(root);
+  const candidate = isAbsolute(ref) ? resolve(ref) : resolve(base, ref);
+  const real = await realpath(candidate).catch(() => undefined);
+  if (!real) return undefined;
+  const realBase = await realpath(base).catch(() => base);
+  return real.startsWith(realBase + sep) ? real : undefined;
 }
 
 export function decodeCarry(encoded: string | undefined): SifSession | undefined {
@@ -286,13 +318,23 @@ export async function storeCarry(
   return { carryRef: path, carryBytes };
 }
 
-/** Recover a carried SIF from either location. Never throws. */
-export async function loadCarry(prov: SinterProvenance | undefined): Promise<SifSession | undefined> {
+/**
+ * Recover a carried SIF from either location. Never throws.
+ *
+ * A sidecar is only read when it resolves inside the carry root — pass `root`
+ * when the payload was written with a non-default one.
+ */
+export async function loadCarry(
+  prov: SinterProvenance | undefined,
+  opts: { root?: string } = {},
+): Promise<SifSession | undefined> {
   if (!prov) return undefined;
   if (prov.carry) return decodeCarry(prov.carry);
   if (!prov.carryRef) return undefined;
+  const path = await resolveCarryRef(prov.carryRef, opts.root);
+  if (!path) return undefined;
   try {
-    const bytes = await Bun.file(prov.carryRef).arrayBuffer();
+    const bytes = await Bun.file(path).arrayBuffer();
     return decodeCarry(Buffer.from(bytes).toString("base64"));
   } catch {
     return undefined;
