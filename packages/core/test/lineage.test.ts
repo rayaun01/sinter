@@ -1,13 +1,15 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { mkdir, symlink } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import {
   CARRY_INLINE_MAX,
   LINEAGE_VERSION,
   SIF_VERSION,
   PRESERVE_KEY,
   buildProvenance,
+  carryRoot,
   carrySidecarPath,
   decodeCarry,
   encodeCarry,
@@ -618,7 +620,7 @@ describe("storeCarry / loadCarry", () => {
     expect(await Bun.file(stored.carryRef!).exists()).toBe(true);
     expect(isInside(root, stored.carryRef!)).toBe(true);
 
-    expect(await loadCarry({ ...baseProv(), ...stored })).toEqual(s);
+    expect(await loadCarry({ ...baseProv(), ...stored }, { root })).toEqual(s);
   });
 
   test("a sidecar for a slash-bearing subagent id still lands inside the carry root", async () => {
@@ -630,7 +632,7 @@ describe("storeCarry / loadCarry", () => {
     expect(stored.carryRef).toBeDefined();
     expect(isInside(root, stored.carryRef!)).toBe(true);
     expect(await Bun.file(stored.carryRef!).exists()).toBe(true);
-    expect(await loadCarry({ ...baseProv(), ...stored })).toEqual(s);
+    expect(await loadCarry({ ...baseProv(), ...stored }, { root })).toEqual(s);
   });
 
   test("returns nothing at all when the session is too big to carry", async () => {
@@ -644,14 +646,14 @@ describe("storeCarry / loadCarry", () => {
   test("loadCarry returns undefined for a missing or corrupt sidecar and never throws", async () => {
     const root = tempRoot();
     const missing = { ...baseProv(), carryRef: join(root, "carry", "omp", "nope.sif.json.gz") };
-    expect(await loadCarry(missing)).toBeUndefined();
+    expect(await loadCarry(missing, { root })).toBeUndefined();
 
     const corruptPath = join(root, "carry", "omp", "corrupt.sif.json.gz");
     await Bun.write(corruptPath, "this is not a gzip stream");
-    expect(await loadCarry({ ...baseProv(), carryRef: corruptPath })).toBeUndefined();
+    expect(await loadCarry({ ...baseProv(), carryRef: corruptPath }, { root })).toBeUndefined();
 
     const dirAsFile = { ...baseProv(), carryRef: join(root, "carry") };
-    expect(await loadCarry(dirAsFile)).toBeUndefined();
+    expect(await loadCarry(dirAsFile, { root })).toBeUndefined();
   });
 
   test("loadCarry returns undefined for no provenance and for provenance with no carry", async () => {
@@ -673,7 +675,50 @@ describe("storeCarry / loadCarry", () => {
     const reread = provenanceOf(JSON.parse(JSON.stringify(written)) as SifSession)!;
 
     expect(reread.carryRef).toBe(stored.carryRef);
-    expect(await loadCarry(reread)).toEqual(s);
+    expect(await loadCarry(reread, { root })).toEqual(s);
+  });
+
+  // A provenance record travels with the session, so `carryRef` is whatever the
+  // party that authored it chose. Nothing outside the carry root may be read.
+  test("loadCarry refuses a carryRef that points outside the carry root", async () => {
+    const root = tempRoot();
+    const secret = join(root, "secret.sif.json.gz");
+    await Bun.write(secret, Buffer.from(encodeCarry(session("codex", "secret"))!, "base64"));
+    // Same bytes inside the root: the refusal is about the path, not the file.
+    const inside = join(root, "carry", "omp", "legit.sif.json.gz");
+    await Bun.write(inside, Buffer.from(encodeCarry(session("codex", "secret"))!, "base64"));
+
+    for (const carryRef of [
+      secret,
+      "/etc/passwd",
+      join(root, "carry", "omp", "..", "..", "secret.sif.json.gz"),
+      "../secret.sif.json.gz",
+      join(homedir(), ".sinter", "carry", "omp", "other.sif.json.gz"),
+    ]) {
+      expect(await loadCarry({ ...baseProv(), carryRef }, { root })).toBeUndefined();
+    }
+
+    expect(await loadCarry({ ...baseProv(), carryRef: inside }, { root })).toBeDefined();
+  });
+
+  test("loadCarry refuses a sidecar symlinked out of the carry root", async () => {
+    const root = tempRoot();
+    const outside = join(root, "outside.sif.json.gz");
+    await Bun.write(outside, Buffer.from(encodeCarry(session("codex", "outside"))!, "base64"));
+    const link = join(root, "carry", "omp", "link.sif.json.gz");
+    await mkdir(dirname(link), { recursive: true });
+    await symlink(outside, link);
+
+    expect(await loadCarry({ ...baseProv(), carryRef: link }, { root })).toBeUndefined();
+  });
+
+  test("a relative carryRef resolves against the carry root", async () => {
+    const root = tempRoot();
+    const s = bigSession("codex", "relative");
+    const stored = await storeCarry(s, { harness: "omp", nativeId: "omp-relative" }, { root });
+    const rel = relative(carryRoot(root), stored.carryRef!);
+
+    expect(await loadCarry({ ...baseProv(), carryRef: rel }, { root })).toEqual(s);
   });
 });
 

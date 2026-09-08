@@ -67,6 +67,8 @@ export interface ReadOptions {
    * See `readWithCarry`.
    */
   useCarry?: boolean;
+  /** Root the carry sidecars were written under (`~/.sinter` by default). */
+  carryRoot?: string;
   host?: string;
 }
 
@@ -394,7 +396,7 @@ export async function readSessionFileDetailed(path: string, opts: ReadOptions): 
   const subsessions: SubsessionLink[] = loadSubs ? await loadSidecarSubsessions(path, opts) : [];
   const session = await buildSession(parsed, path, opts, subsessions);
   if (!opts.useCarry) return { session, parsed };
-  const recovered = await recoverCarry(session, parsed);
+  const recovered = await recoverCarry(session, parsed, opts);
   return { session: recovered.session, parsed, carried: recovered.carried };
 }
 
@@ -423,8 +425,12 @@ function entriesAfterPort(session: SifSession, parsed: ParsedFile): SifEntry[] {
   return session.entries.filter((e) => e.kind !== "subsession" && !portedIds.has(e.id));
 }
 
-async function recoverCarry(session: SifSession, parsed: ParsedFile): Promise<{ session: SifSession; carried: boolean }> {
-  const carried = await loadCarry(provenanceOf(session));
+async function recoverCarry(
+  session: SifSession,
+  parsed: ParsedFile,
+  opts: ReadOptions,
+): Promise<{ session: SifSession; carried: boolean }> {
+  const carried = await loadCarry(provenanceOf(session), { root: opts.carryRoot });
   if (!carried?.entries?.length) return { session, carried: false };
 
   const ids = new Set(carried.entries.map((e) => e.id));
